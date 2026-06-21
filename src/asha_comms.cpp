@@ -2,6 +2,8 @@
 #include <pico/stdio.h>
 #include <pico/stdio_usb.h>
 
+#include <tusb.h>
+
 #include <etl/circular_buffer.h>
 #include <nanocobs/cobs.h>
 
@@ -34,7 +36,7 @@ namespace comm
             orig_len = __builtin_bswap32(orig_len);
             incl_len = __builtin_bswap32(incl_len);
             pkt_flags = __builtin_bswap32(pkt_flags);
-            cuml_drops = __builtin_bswap32(pkt_flags);
+            cuml_drops = __builtin_bswap32(cuml_drops);
             ts_us = __builtin_bswap64(ts_us);
         }
     };
@@ -218,8 +220,17 @@ namespace comm
         cobs_encode_inc(&enc_ctx, packet, incl_len);
         cobs_encode_inc_end(&enc_ctx, &enc_len);
 
-        stdio_put_string((const char*)cobs_enc_buff, enc_len + zero_prefix, false, false);
-        stdio_flush();
+        // Write directly to CDC rather than via stdio_put_string(): the stdio
+        // path also writes to UART, where uart_putc() blocks on TX FIFO space
+        // at 115200 baud — at ~17 ms per 200-byte packet, this stalls core 1
+        // and causes the audio timer to miss ticks.
+        // This bypasses stdio_usb_mutex, creating a theoretical race if core 0
+        // calls tud_cdc_write() via stdio simultaneously. In practice core 0
+        // makes no stdio calls during audio streaming, so the risk is negligible.
+        uint32_t total = enc_len + zero_prefix;
+        if (tud_cdc_write_available() < total) return;
+        tud_cdc_write(cobs_enc_buff, total);
+        tud_cdc_write_flush();
     }
 
     void send_hci_message([[maybe_unused]] int log_level, 
